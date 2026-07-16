@@ -127,7 +127,6 @@ struct OakDevice::Impl {
     std::shared_ptr<dai::MessageQueue> rgb_queue;
     std::shared_ptr<dai::MessageQueue> left_ir_queue;
     std::shared_ptr<dai::MessageQueue> right_ir_queue;
-    std::shared_ptr<dai::MessageQueue> depth_keepalive_queue;
 
     std::thread rgb_worker;
     std::thread left_ir_worker;
@@ -513,6 +512,7 @@ bool OakDevice::start_streams() {
             auto camera = impl_->pipeline
                               ->create<dai::node::Camera>()
                               ->build(dai::CameraBoardSocket::CAM_A);
+            camera->setOutputsNumFramesPool(1);
 
             auto output = camera->requestOutput(
                 std::make_pair(width, height),
@@ -541,12 +541,15 @@ bool OakDevice::start_streams() {
                 left_fps != right_fps
             ) {
                 impl_->set_error(
-                    "Los streams IR estéreo deben usar la misma resolución y FPS."
+                    "Los streams IR emparejados deben usar la misma resolución y FPS."
                 );
                 stop();
                 return false;
             }
 
+            // Low-latency preview path:
+            // read both mono cameras directly. Do not route preview frames
+            // through StereoDepth, rectification or dynamic calibration.
             auto left_camera = impl_->pipeline
                                    ->create<dai::node::Camera>()
                                    ->build(dai::CameraBoardSocket::CAM_B);
@@ -554,39 +557,34 @@ bool OakDevice::start_streams() {
                                     ->create<dai::node::Camera>()
                                     ->build(dai::CameraBoardSocket::CAM_C);
 
-            auto left_output = left_camera->requestOutput(
-                std::make_pair(left_width, left_height),
-                dai::ImgFrame::Type::GRAY8,
-                dai::ImgResizeMode::LETTERBOX,
-                static_cast<float>(left_fps),
-                std::nullopt
-            );
-            auto right_output = right_camera->requestOutput(
-                std::make_pair(right_width, right_height),
-                dai::ImgFrame::Type::GRAY8,
-                dai::ImgResizeMode::LETTERBOX,
-                static_cast<float>(right_fps),
-                std::nullopt
-            );
+            left_camera->setOutputsNumFramesPool(1);
+            right_camera->setOutputsNumFramesPool(1);
 
-            // Tratar CAM_B y CAM_C como un par estéreo. StereoDepth sincroniza
-            // ambas entradas y expone las imágenes emparejadas en syncedLeft
-            // y syncedRight. En el siguiente PR reutilizaremos este mismo nodo
-            // para obtener depth y disparity.
-            auto stereo = impl_->pipeline->create<dai::node::StereoDepth>();
-            left_output->link(stereo->left);
-            right_output->link(stereo->right);
+            dai::ImgFrameCapability left_capability;
+            left_capability.size.fixed(
+                std::make_pair(left_width, left_height)
+            );
+            left_capability.fps.fixed(static_cast<float>(left_fps));
+            left_capability.type = dai::ImgFrame::Type::GRAY8;
+            left_capability.resizeMode = dai::ImgResizeMode::CROP;
 
-            // En DepthAI v3, syncedLeft/syncedRight son salidas auxiliares.
-            // Activamos también una salida principal de StereoDepth para que
-            // el nodo sea considerado utilizado por el pipeline.
-            impl_->depth_keepalive_queue =
-                stereo->depth.createOutputQueue(1, false);
+            dai::ImgFrameCapability right_capability;
+            right_capability.size.fixed(
+                std::make_pair(right_width, right_height)
+            );
+            right_capability.fps.fixed(static_cast<float>(right_fps));
+            right_capability.type = dai::ImgFrame::Type::GRAY8;
+            right_capability.resizeMode = dai::ImgResizeMode::CROP;
+
+            auto left_output =
+                left_camera->requestOutput(left_capability, false);
+            auto right_output =
+                right_camera->requestOutput(right_capability, false);
 
             impl_->left_ir_queue =
-                stereo->syncedLeft.createOutputQueue(1, false);
+                left_output->createOutputQueue(1, false);
             impl_->right_ir_queue =
-                stereo->syncedRight.createOutputQueue(1, false);
+                right_output->createOutputQueue(1, false);
             impl_->stereo_pair_active.store(true);
 
             configure_frame(
@@ -610,6 +608,7 @@ bool OakDevice::start_streams() {
                 auto camera = impl_->pipeline
                                   ->create<dai::node::Camera>()
                                   ->build(dai::CameraBoardSocket::CAM_B);
+                camera->setOutputsNumFramesPool(1);
 
                 auto output = camera->requestOutput(
                     std::make_pair(width, height),
@@ -631,6 +630,7 @@ bool OakDevice::start_streams() {
                 auto camera = impl_->pipeline
                                   ->create<dai::node::Camera>()
                                   ->build(dai::CameraBoardSocket::CAM_C);
+                camera->setOutputsNumFramesPool(1);
 
                 auto output = camera->requestOutput(
                     std::make_pair(width, height),
@@ -946,7 +946,6 @@ void OakDevice::stop() {
     impl_->rgb_queue.reset();
     impl_->left_ir_queue.reset();
     impl_->right_ir_queue.reset();
-    impl_->depth_keepalive_queue.reset();
     impl_->stereo_pair_active.store(false);
     impl_->pipeline.reset();
 }
