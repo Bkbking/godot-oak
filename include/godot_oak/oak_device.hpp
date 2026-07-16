@@ -34,6 +34,7 @@ public:
     godot::Ref<godot::Texture2D> get_rgb_texture();
     godot::Ref<godot::Texture2D> get_left_ir_texture();
     godot::Ref<godot::Texture2D> get_right_ir_texture();
+    bool update_stereo_ir_textures();
 
     void set_rgb_config(const godot::Ref<OakStreamConfig>& config);
     [[nodiscard]] godot::Ref<OakStreamConfig> get_rgb_config() const;
@@ -60,6 +61,29 @@ public:
     [[nodiscard]] int64_t get_rgb_frame_count() const;
     [[nodiscard]] int64_t get_left_ir_frame_count() const;
     [[nodiscard]] int64_t get_right_ir_frame_count() const;
+
+    [[nodiscard]] int64_t get_rgb_presented_count() const;
+    [[nodiscard]] int64_t get_left_ir_presented_count() const;
+    [[nodiscard]] int64_t get_right_ir_presented_count() const;
+
+    [[nodiscard]] int64_t get_rgb_dropped_count() const;
+    [[nodiscard]] int64_t get_left_ir_dropped_count() const;
+    [[nodiscard]] int64_t get_right_ir_dropped_count() const;
+
+    [[nodiscard]] double get_rgb_host_latency_ms() const;
+    [[nodiscard]] double get_left_ir_host_latency_ms() const;
+    [[nodiscard]] double get_right_ir_host_latency_ms() const;
+
+    [[nodiscard]] double get_rgb_texture_update_ms() const;
+    [[nodiscard]] double get_left_ir_texture_update_ms() const;
+    [[nodiscard]] double get_right_ir_texture_update_ms() const;
+
+    [[nodiscard]] double get_rgb_capture_to_host_ms() const;
+    [[nodiscard]] double get_left_ir_capture_to_host_ms() const;
+    [[nodiscard]] double get_right_ir_capture_to_host_ms() const;
+    [[nodiscard]] double get_stereo_timestamp_skew_ms() const;
+    [[nodiscard]] int64_t get_stereo_pair_count() const;
+    [[nodiscard]] int64_t get_stereo_mismatch_count() const;
 
 protected:
     static void _bind_methods();

@@ -26,7 +26,16 @@ struct CpuFrame {
     int width = 0;
     int height = 0;
     bool ready = false;
+    std::chrono::steady_clock::time_point arrival_time{};
+    std::chrono::steady_clock::time_point capture_time{};
+
     std::atomic<int64_t> count{0};
+    std::atomic<int64_t> presented{0};
+    std::atomic<int64_t> dropped{0};
+    std::atomic<double> capture_to_host_ms{0.0};
+    std::atomic<double> host_latency_ms{0.0};
+    std::atomic<double> texture_update_ms{0.0};
+
     godot::Ref<godot::ImageTexture> texture;
 };
 
@@ -37,6 +46,7 @@ godot::Ref<godot::Texture2D> update_texture(
     std::vector<std::uint8_t> data;
     int width = 0;
     int height = 0;
+    std::chrono::steady_clock::time_point arrival_time;
 
     {
         std::scoped_lock lock(frame.mutex);
@@ -44,11 +54,16 @@ godot::Ref<godot::Texture2D> update_texture(
             return frame.texture;
         }
 
-        data = frame.data;
+        // Latest-frame-wins: transfer ownership of the newest CPU buffer
+        // instead of copying it into a second std::vector.
+        data.swap(frame.data);
         width = frame.width;
         height = frame.height;
+        arrival_time = frame.arrival_time;
         frame.ready = false;
     }
+
+    const auto update_start = std::chrono::steady_clock::now();
 
     godot::PackedByteArray bytes;
     bytes.resize(static_cast<int64_t>(data.size()));
@@ -68,6 +83,20 @@ godot::Ref<godot::Texture2D> update_texture(
         frame.texture->update(image);
     }
 
+    const auto update_end = std::chrono::steady_clock::now();
+    const double host_latency =
+        std::chrono::duration<double, std::milli>(
+            update_end - arrival_time
+        ).count();
+    const double texture_update =
+        std::chrono::duration<double, std::milli>(
+            update_end - update_start
+        ).count();
+
+    frame.host_latency_ms.store(host_latency);
+    frame.texture_update_ms.store(texture_update);
+    frame.presented.fetch_add(1);
+
     return frame.texture;
 }
 
@@ -77,7 +106,13 @@ void configure_frame(CpuFrame& frame, int width, int height, int channels) {
     frame.height = height;
     frame.ready = false;
     frame.count.store(0);
-    frame.data.resize(
+    frame.presented.store(0);
+    frame.dropped.store(0);
+    frame.capture_to_host_ms.store(0.0);
+    frame.host_latency_ms.store(0.0);
+    frame.texture_update_ms.store(0.0);
+    frame.data.clear();
+    frame.data.reserve(
         static_cast<std::size_t>(width) *
         static_cast<std::size_t>(height) *
         static_cast<std::size_t>(channels)
@@ -97,6 +132,7 @@ struct OakDevice::Impl {
     std::thread rgb_worker;
     std::thread left_ir_worker;
     std::thread right_ir_worker;
+    std::thread stereo_ir_worker;
 
     std::atomic_bool running{false};
     std::atomic_bool opened{false};
@@ -104,6 +140,11 @@ struct OakDevice::Impl {
     CpuFrame rgb;
     CpuFrame left_ir;
     CpuFrame right_ir;
+
+    std::atomic_bool stereo_pair_active{false};
+    std::atomic<int64_t> stereo_pair_count{0};
+    std::atomic<int64_t> stereo_mismatch_count{0};
+    std::atomic<double> stereo_timestamp_skew_ms{0.0};
 
     mutable std::mutex error_mutex;
     std::string last_error;
@@ -176,6 +217,10 @@ void OakDevice::_bind_methods() {
     godot::ClassDB::bind_method(
         godot::D_METHOD("get_right_ir_texture"),
         &OakDevice::get_right_ir_texture
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("update_stereo_ir_textures"),
+        &OakDevice::update_stereo_ir_textures
     );
 
     godot::ClassDB::bind_method(
@@ -251,6 +296,83 @@ void OakDevice::_bind_methods() {
     godot::ClassDB::bind_method(
         godot::D_METHOD("get_right_ir_frame_count"),
         &OakDevice::get_right_ir_frame_count
+    );
+
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_rgb_presented_count"),
+        &OakDevice::get_rgb_presented_count
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_left_ir_presented_count"),
+        &OakDevice::get_left_ir_presented_count
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_right_ir_presented_count"),
+        &OakDevice::get_right_ir_presented_count
+    );
+
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_rgb_dropped_count"),
+        &OakDevice::get_rgb_dropped_count
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_left_ir_dropped_count"),
+        &OakDevice::get_left_ir_dropped_count
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_right_ir_dropped_count"),
+        &OakDevice::get_right_ir_dropped_count
+    );
+
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_rgb_host_latency_ms"),
+        &OakDevice::get_rgb_host_latency_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_left_ir_host_latency_ms"),
+        &OakDevice::get_left_ir_host_latency_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_right_ir_host_latency_ms"),
+        &OakDevice::get_right_ir_host_latency_ms
+    );
+
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_rgb_texture_update_ms"),
+        &OakDevice::get_rgb_texture_update_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_left_ir_texture_update_ms"),
+        &OakDevice::get_left_ir_texture_update_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_right_ir_texture_update_ms"),
+        &OakDevice::get_right_ir_texture_update_ms
+    );
+
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_rgb_capture_to_host_ms"),
+        &OakDevice::get_rgb_capture_to_host_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_left_ir_capture_to_host_ms"),
+        &OakDevice::get_left_ir_capture_to_host_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_right_ir_capture_to_host_ms"),
+        &OakDevice::get_right_ir_capture_to_host_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_stereo_timestamp_skew_ms"),
+        &OakDevice::get_stereo_timestamp_skew_ms
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_stereo_pair_count"),
+        &OakDevice::get_stereo_pair_count
+    );
+    godot::ClassDB::bind_method(
+        godot::D_METHOD("get_stereo_mismatch_count"),
+        &OakDevice::get_stereo_mismatch_count
     );
 
     ADD_GROUP("Startup", "");
@@ -366,6 +488,11 @@ bool OakDevice::start_right_ir(const godot::Ref<OakStreamConfig>& config) {
 bool OakDevice::start_streams() {
     stop();
 
+    impl_->stereo_pair_active.store(false);
+    impl_->stereo_pair_count.store(0);
+    impl_->stereo_mismatch_count.store(0);
+    impl_->stereo_timestamp_skew_ms.store(0.0);
+
     if(!open()) {
         return false;
     }
@@ -389,13 +516,13 @@ bool OakDevice::start_streams() {
 
             auto output = camera->requestOutput(
                 std::make_pair(width, height),
-                dai::ImgFrame::Type::BGR888i,
+                dai::ImgFrame::Type::RGB888i,
                 dai::ImgResizeMode::LETTERBOX,
                 static_cast<float>(fps),
                 std::nullopt
             );
 
-            impl_->rgb_queue = output->createOutputQueue(2, false);
+            impl_->rgb_queue = output->createOutputQueue(1, false);
             configure_frame(impl_->rgb, width, height, 3);
         }
 
@@ -457,9 +584,10 @@ bool OakDevice::start_streams() {
                 stereo->depth.createOutputQueue(1, false);
 
             impl_->left_ir_queue =
-                stereo->syncedLeft.createOutputQueue(2, false);
+                stereo->syncedLeft.createOutputQueue(1, false);
             impl_->right_ir_queue =
-                stereo->syncedRight.createOutputQueue(2, false);
+                stereo->syncedRight.createOutputQueue(1, false);
+            impl_->stereo_pair_active.store(true);
 
             configure_frame(
                 impl_->left_ir,
@@ -491,7 +619,7 @@ bool OakDevice::start_streams() {
                     std::nullopt
                 );
 
-                impl_->left_ir_queue = output->createOutputQueue(2, false);
+                impl_->left_ir_queue = output->createOutputQueue(1, false);
                 configure_frame(impl_->left_ir, width, height, 1);
             }
 
@@ -512,7 +640,7 @@ bool OakDevice::start_streams() {
                     std::nullopt
                 );
 
-                impl_->right_ir_queue = output->createOutputQueue(2, false);
+                impl_->right_ir_queue = output->createOutputQueue(1, false);
                 configure_frame(impl_->right_ir, width, height, 1);
             }
         }
@@ -531,25 +659,35 @@ bool OakDevice::start_streams() {
                             continue;
                         }
 
-                        const auto& bgr = frame->getData();
+                        const auto& rgb = frame->getData();
                         const std::size_t expected =
                             static_cast<std::size_t>(impl_->rgb.width) *
                             static_cast<std::size_t>(impl_->rgb.height) *
                             3U;
 
-                        if(bgr.size() < expected) {
+                        if(rgb.size() < expected) {
                             continue;
                         }
 
                         std::scoped_lock lock(impl_->rgb.mutex);
-                        impl_->rgb.data.resize(expected);
-
-                        for(std::size_t index = 0; index < expected; index += 3) {
-                            impl_->rgb.data[index] = bgr[index + 2];
-                            impl_->rgb.data[index + 1] = bgr[index + 1];
-                            impl_->rgb.data[index + 2] = bgr[index];
+                        if(impl_->rgb.ready) {
+                            impl_->rgb.dropped.fetch_add(1);
                         }
 
+                        impl_->rgb.data.assign(
+                            rgb.begin(),
+                            rgb.begin() + static_cast<std::ptrdiff_t>(expected)
+                        );
+                        const auto arrival = std::chrono::steady_clock::now();
+                        const auto capture = frame->getTimestamp();
+
+                        impl_->rgb.arrival_time = arrival;
+                        impl_->rgb.capture_time = capture;
+                        impl_->rgb.capture_to_host_ms.store(
+                            std::chrono::duration<double, std::milli>(
+                                arrival - capture
+                            ).count()
+                        );
                         impl_->rgb.ready = true;
                         impl_->rgb.count.fetch_add(1);
                     }
@@ -575,7 +713,9 @@ bool OakDevice::start_streams() {
                     while(impl_->running.load()) {
                         auto frame = queue->tryGet<dai::ImgFrame>();
                         if(!frame) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(1)
+                            );
                             continue;
                         }
 
@@ -588,10 +728,25 @@ bool OakDevice::start_streams() {
                             continue;
                         }
 
+                        const auto arrival = std::chrono::steady_clock::now();
+                        const auto capture = frame->getTimestamp();
+
                         std::scoped_lock lock(destination.mutex);
+                        if(destination.ready) {
+                            destination.dropped.fetch_add(1);
+                        }
+
                         destination.data.assign(
                             gray.begin(),
-                            gray.begin() + static_cast<std::ptrdiff_t>(expected)
+                            gray.begin() +
+                                static_cast<std::ptrdiff_t>(expected)
+                        );
+                        destination.arrival_time = arrival;
+                        destination.capture_time = capture;
+                        destination.capture_to_host_ms.store(
+                            std::chrono::duration<double, std::milli>(
+                                arrival - capture
+                            ).count()
                         );
                         destination.ready = true;
                         destination.count.fetch_add(1);
@@ -604,16 +759,153 @@ bool OakDevice::start_streams() {
             });
         };
 
-        start_gray_worker(
-            impl_->left_ir_queue,
-            impl_->left_ir,
-            impl_->left_ir_worker
-        );
-        start_gray_worker(
-            impl_->right_ir_queue,
-            impl_->right_ir,
-            impl_->right_ir_worker
-        );
+        if(impl_->stereo_pair_active.load()) {
+            impl_->stereo_ir_worker = std::thread([this]() {
+                std::shared_ptr<dai::ImgFrame> pending_left;
+                std::shared_ptr<dai::ImgFrame> pending_right;
+
+                try {
+                    while(impl_->running.load()) {
+                        if(!pending_left) {
+                            pending_left =
+                                impl_->left_ir_queue->tryGet<dai::ImgFrame>();
+                        }
+                        if(!pending_right) {
+                            pending_right =
+                                impl_->right_ir_queue->tryGet<dai::ImgFrame>();
+                        }
+
+                        if(!pending_left || !pending_right) {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(1)
+                            );
+                            continue;
+                        }
+
+                        const auto left_sequence =
+                            pending_left->getSequenceNum();
+                        const auto right_sequence =
+                            pending_right->getSequenceNum();
+
+                        if(left_sequence < right_sequence) {
+                            impl_->left_ir.dropped.fetch_add(1);
+                            impl_->stereo_mismatch_count.fetch_add(1);
+                            pending_left.reset();
+                            continue;
+                        }
+                        if(right_sequence < left_sequence) {
+                            impl_->right_ir.dropped.fetch_add(1);
+                            impl_->stereo_mismatch_count.fetch_add(1);
+                            pending_right.reset();
+                            continue;
+                        }
+
+                        const auto& left_data = pending_left->getData();
+                        const auto& right_data = pending_right->getData();
+                        const std::size_t left_expected =
+                            static_cast<std::size_t>(impl_->left_ir.width) *
+                            static_cast<std::size_t>(impl_->left_ir.height);
+                        const std::size_t right_expected =
+                            static_cast<std::size_t>(impl_->right_ir.width) *
+                            static_cast<std::size_t>(impl_->right_ir.height);
+
+                        if(
+                            left_data.size() < left_expected ||
+                            right_data.size() < right_expected
+                        ) {
+                            impl_->stereo_mismatch_count.fetch_add(1);
+                            pending_left.reset();
+                            pending_right.reset();
+                            continue;
+                        }
+
+                        const auto arrival =
+                            std::chrono::steady_clock::now();
+                        const auto left_capture =
+                            pending_left->getTimestamp();
+                        const auto right_capture =
+                            pending_right->getTimestamp();
+
+                        const double skew_ms = std::abs(
+                            std::chrono::duration<double, std::milli>(
+                                left_capture - right_capture
+                            ).count()
+                        );
+
+                        {
+                            std::scoped_lock lock(
+                                impl_->left_ir.mutex,
+                                impl_->right_ir.mutex
+                            );
+
+                            if(
+                                impl_->left_ir.ready ||
+                                impl_->right_ir.ready
+                            ) {
+                                impl_->left_ir.dropped.fetch_add(1);
+                                impl_->right_ir.dropped.fetch_add(1);
+                            }
+
+                            impl_->left_ir.data.assign(
+                                left_data.begin(),
+                                left_data.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        left_expected
+                                    )
+                            );
+                            impl_->right_ir.data.assign(
+                                right_data.begin(),
+                                right_data.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        right_expected
+                                    )
+                            );
+
+                            impl_->left_ir.arrival_time = arrival;
+                            impl_->right_ir.arrival_time = arrival;
+                            impl_->left_ir.capture_time = left_capture;
+                            impl_->right_ir.capture_time = right_capture;
+                            impl_->left_ir.capture_to_host_ms.store(
+                                std::chrono::duration<double, std::milli>(
+                                    arrival - left_capture
+                                ).count()
+                            );
+                            impl_->right_ir.capture_to_host_ms.store(
+                                std::chrono::duration<double, std::milli>(
+                                    arrival - right_capture
+                                ).count()
+                            );
+
+                            impl_->left_ir.ready = true;
+                            impl_->right_ir.ready = true;
+                            impl_->left_ir.count.fetch_add(1);
+                            impl_->right_ir.count.fetch_add(1);
+                        }
+
+                        impl_->stereo_timestamp_skew_ms.store(skew_ms);
+                        impl_->stereo_pair_count.fetch_add(1);
+
+                        pending_left.reset();
+                        pending_right.reset();
+                    }
+                } catch(const std::exception& error) {
+                    if(impl_->running.load()) {
+                        impl_->set_error(error.what());
+                    }
+                }
+            });
+        } else {
+            start_gray_worker(
+                impl_->left_ir_queue,
+                impl_->left_ir,
+                impl_->left_ir_worker
+            );
+            start_gray_worker(
+                impl_->right_ir_queue,
+                impl_->right_ir,
+                impl_->right_ir_worker
+            );
+        }
 
         return true;
     } catch(const std::exception& error) {
@@ -638,6 +930,9 @@ void OakDevice::stop() {
     if(impl_->right_ir_worker.joinable()) {
         impl_->right_ir_worker.join();
     }
+    if(impl_->stereo_ir_worker.joinable()) {
+        impl_->stereo_ir_worker.join();
+    }
 
     if(impl_->pipeline) {
         try {
@@ -652,6 +947,7 @@ void OakDevice::stop() {
     impl_->left_ir_queue.reset();
     impl_->right_ir_queue.reset();
     impl_->depth_keepalive_queue.reset();
+    impl_->stereo_pair_active.store(false);
     impl_->pipeline.reset();
 }
 
@@ -671,15 +967,113 @@ bool OakDevice::is_streaming() const {
     return impl_->running.load();
 }
 
+bool OakDevice::update_stereo_ir_textures() {
+    if(!impl_->stereo_pair_active.load()) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> left_data;
+    std::vector<std::uint8_t> right_data;
+    int left_width = 0;
+    int left_height = 0;
+    int right_width = 0;
+    int right_height = 0;
+    std::chrono::steady_clock::time_point left_arrival;
+    std::chrono::steady_clock::time_point right_arrival;
+
+    {
+        std::scoped_lock lock(
+            impl_->left_ir.mutex,
+            impl_->right_ir.mutex
+        );
+
+        if(!impl_->left_ir.ready || !impl_->right_ir.ready) {
+            return false;
+        }
+
+        left_data.swap(impl_->left_ir.data);
+        right_data.swap(impl_->right_ir.data);
+        left_width = impl_->left_ir.width;
+        left_height = impl_->left_ir.height;
+        right_width = impl_->right_ir.width;
+        right_height = impl_->right_ir.height;
+        left_arrival = impl_->left_ir.arrival_time;
+        right_arrival = impl_->right_ir.arrival_time;
+        impl_->left_ir.ready = false;
+        impl_->right_ir.ready = false;
+    }
+
+    const auto update_start = std::chrono::steady_clock::now();
+
+    auto update_one = [](
+        CpuFrame& destination,
+        const std::vector<std::uint8_t>& data,
+        int width,
+        int height
+    ) {
+        godot::PackedByteArray bytes;
+        bytes.resize(static_cast<int64_t>(data.size()));
+        std::memcpy(bytes.ptrw(), data.data(), data.size());
+
+        const godot::Ref<godot::Image> image =
+            godot::Image::create_from_data(
+                width,
+                height,
+                false,
+                godot::Image::FORMAT_L8,
+                bytes
+            );
+
+        if(destination.texture.is_null()) {
+            destination.texture =
+                godot::ImageTexture::create_from_image(image);
+        } else {
+            destination.texture->update(image);
+        }
+    };
+
+    update_one(impl_->left_ir, left_data, left_width, left_height);
+    update_one(impl_->right_ir, right_data, right_width, right_height);
+
+    const auto update_end = std::chrono::steady_clock::now();
+    const double pair_update_ms =
+        std::chrono::duration<double, std::milli>(
+            update_end - update_start
+        ).count();
+
+    impl_->left_ir.host_latency_ms.store(
+        std::chrono::duration<double, std::milli>(
+            update_end - left_arrival
+        ).count()
+    );
+    impl_->right_ir.host_latency_ms.store(
+        std::chrono::duration<double, std::milli>(
+            update_end - right_arrival
+        ).count()
+    );
+    impl_->left_ir.texture_update_ms.store(pair_update_ms);
+    impl_->right_ir.texture_update_ms.store(pair_update_ms);
+    impl_->left_ir.presented.fetch_add(1);
+    impl_->right_ir.presented.fetch_add(1);
+
+    return true;
+}
+
 godot::Ref<godot::Texture2D> OakDevice::get_rgb_texture() {
     return update_texture(impl_->rgb, godot::Image::FORMAT_RGB8);
 }
 
 godot::Ref<godot::Texture2D> OakDevice::get_left_ir_texture() {
+    if(impl_->stereo_pair_active.load()) {
+        return impl_->left_ir.texture;
+    }
     return update_texture(impl_->left_ir, godot::Image::FORMAT_L8);
 }
 
 godot::Ref<godot::Texture2D> OakDevice::get_right_ir_texture() {
+    if(impl_->stereo_pair_active.load()) {
+        return impl_->right_ir.texture;
+    }
     return update_texture(impl_->right_ir, godot::Image::FORMAT_L8);
 }
 
@@ -759,6 +1153,78 @@ int64_t OakDevice::get_left_ir_frame_count() const {
 
 int64_t OakDevice::get_right_ir_frame_count() const {
     return impl_->right_ir.count.load();
+}
+
+int64_t OakDevice::get_rgb_presented_count() const {
+    return impl_->rgb.presented.load();
+}
+
+int64_t OakDevice::get_left_ir_presented_count() const {
+    return impl_->left_ir.presented.load();
+}
+
+int64_t OakDevice::get_right_ir_presented_count() const {
+    return impl_->right_ir.presented.load();
+}
+
+int64_t OakDevice::get_rgb_dropped_count() const {
+    return impl_->rgb.dropped.load();
+}
+
+int64_t OakDevice::get_left_ir_dropped_count() const {
+    return impl_->left_ir.dropped.load();
+}
+
+int64_t OakDevice::get_right_ir_dropped_count() const {
+    return impl_->right_ir.dropped.load();
+}
+
+double OakDevice::get_rgb_host_latency_ms() const {
+    return impl_->rgb.host_latency_ms.load();
+}
+
+double OakDevice::get_left_ir_host_latency_ms() const {
+    return impl_->left_ir.host_latency_ms.load();
+}
+
+double OakDevice::get_right_ir_host_latency_ms() const {
+    return impl_->right_ir.host_latency_ms.load();
+}
+
+double OakDevice::get_rgb_texture_update_ms() const {
+    return impl_->rgb.texture_update_ms.load();
+}
+
+double OakDevice::get_left_ir_texture_update_ms() const {
+    return impl_->left_ir.texture_update_ms.load();
+}
+
+double OakDevice::get_right_ir_texture_update_ms() const {
+    return impl_->right_ir.texture_update_ms.load();
+}
+
+double OakDevice::get_rgb_capture_to_host_ms() const {
+    return impl_->rgb.capture_to_host_ms.load();
+}
+
+double OakDevice::get_left_ir_capture_to_host_ms() const {
+    return impl_->left_ir.capture_to_host_ms.load();
+}
+
+double OakDevice::get_right_ir_capture_to_host_ms() const {
+    return impl_->right_ir.capture_to_host_ms.load();
+}
+
+double OakDevice::get_stereo_timestamp_skew_ms() const {
+    return impl_->stereo_timestamp_skew_ms.load();
+}
+
+int64_t OakDevice::get_stereo_pair_count() const {
+    return impl_->stereo_pair_count.load();
+}
+
+int64_t OakDevice::get_stereo_mismatch_count() const {
+    return impl_->stereo_mismatch_count.load();
 }
 
 godot::String OakDevice::get_last_error() const {
