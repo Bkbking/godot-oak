@@ -1,4 +1,5 @@
 #include "godot_oak/oak_device.hpp"
+#include "godot_oak/oak_stream_config.hpp"
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/defs.hpp>
@@ -8,6 +9,7 @@ using namespace godot;
 
 void initialize_godot_oak(ModuleInitializationLevel level) {
     if(level != MODULE_INITIALIZATION_LEVEL_SCENE) return;
+    ClassDB::register_class<godot_oak::OakStreamConfig>();
     ClassDB::register_class<godot_oak::OakDevice>();
 }
 

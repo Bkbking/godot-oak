@@ -24,6 +24,7 @@ struct OakDevice::Impl {
     std::vector<uint8_t> latest_rgb;
     int width = 0;
     int height = 0;
+    int fps = 0;
     bool frame_ready = false;
 
     mutable std::mutex error_mutex;
@@ -42,7 +43,8 @@ OakDevice::~OakDevice() { close(); }
 
 void OakDevice::_bind_methods() {
     godot::ClassDB::bind_method(godot::D_METHOD("open"), &OakDevice::open);
-    godot::ClassDB::bind_method(godot::D_METHOD("start_rgb", "width", "height", "fps"), &OakDevice::start_rgb, 640, 360, 30);
+    godot::ClassDB::bind_method(godot::D_METHOD("start_rgb", "config"), &OakDevice::start_rgb);
+    godot::ClassDB::bind_method(godot::D_METHOD("start_rgb_values", "width", "height", "fps"), &OakDevice::start_rgb_values, 640, 360, 30);
     godot::ClassDB::bind_method(godot::D_METHOD("stop"), &OakDevice::stop);
     godot::ClassDB::bind_method(godot::D_METHOD("close"), &OakDevice::close);
     godot::ClassDB::bind_method(godot::D_METHOD("is_open"), &OakDevice::is_open);
@@ -50,6 +52,9 @@ void OakDevice::_bind_methods() {
     godot::ClassDB::bind_method(godot::D_METHOD("get_texture"), &OakDevice::get_texture);
     godot::ClassDB::bind_method(godot::D_METHOD("get_last_error"), &OakDevice::get_last_error);
     godot::ClassDB::bind_method(godot::D_METHOD("get_frame_count"), &OakDevice::get_frame_count);
+    godot::ClassDB::bind_method(godot::D_METHOD("get_active_width"), &OakDevice::get_active_width);
+    godot::ClassDB::bind_method(godot::D_METHOD("get_active_height"), &OakDevice::get_active_height);
+    godot::ClassDB::bind_method(godot::D_METHOD("get_active_fps"), &OakDevice::get_active_fps);
     ADD_PROPERTY(godot::PropertyInfo(godot::Variant::OBJECT, "texture", godot::PROPERTY_HINT_RESOURCE_TYPE, "ImageTexture"), "", "get_texture");
 }
 
@@ -70,7 +75,15 @@ bool OakDevice::open() {
     }
 }
 
-bool OakDevice::start_rgb(int width, int height, int fps) {
+bool OakDevice::start_rgb(const godot::Ref<OakStreamConfig>& config) {
+    if(config.is_null()) {
+        impl_->set_error("La configuración RGB no puede ser nula.");
+        return false;
+    }
+    return start_rgb_values(config->get_width(), config->get_height(), config->get_fps());
+}
+
+bool OakDevice::start_rgb_values(int width, int height, int fps) {
     if(impl_->running.load()) return true;
     if(!open()) return false;
     if(width <= 0 || height <= 0 || fps <= 0) {
@@ -93,6 +106,7 @@ bool OakDevice::start_rgb(int width, int height, int fps) {
 
         impl_->width = width;
         impl_->height = height;
+        impl_->fps = fps;
         impl_->latest_rgb.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 3U);
         impl_->frame_ready = false;
         impl_->frame_count.store(0);
@@ -153,6 +167,9 @@ void OakDevice::close() {
 bool OakDevice::is_open() const { return impl_->opened.load(); }
 bool OakDevice::is_streaming() const { return impl_->running.load(); }
 int64_t OakDevice::get_frame_count() const { return impl_->frame_count.load(); }
+int OakDevice::get_active_width() const { return impl_->width; }
+int OakDevice::get_active_height() const { return impl_->height; }
+int OakDevice::get_active_fps() const { return impl_->fps; }
 
 godot::String OakDevice::get_last_error() const {
     std::scoped_lock lock(impl_->error_mutex);
