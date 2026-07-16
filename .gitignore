@@ -1,0 +1,21 @@
+build/
+third_party/godot-cpp/
+third_party/depthai-core/
+third_party/depthai-install/
+godot/addons/godot_oak/bin/*
+!godot/addons/godot_oak/bin/.gitkeep
+.DS_Store
+
+# Local third-party dependencies and installations
+third_party/depthai-core/
+third_party/godot-cpp/
+third_party/depthai-install/
+third_party/pkgconf-install/
+
+# Generated binaries
+godot/addons/godot_oak/bin/*
+!godot/addons/godot_oak/bin/.gitkeep
+
+# Godot generated metadata
+godot/.godot/
+*.uid

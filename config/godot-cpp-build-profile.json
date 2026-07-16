@@ -1,0 +1,12 @@
+{
+  "enabled_classes": [
+    "Image",
+    "ImageTexture",
+    "Node",
+    "Object",
+    "OS",
+    "RefCounted",
+    "Resource",
+    "Texture2D"
+  ]
+}
