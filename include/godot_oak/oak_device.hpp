@@ -24,6 +24,7 @@ public:
     bool start_streams();
     bool start_rgb(const godot::Ref<OakStreamConfig>& config);
     bool start_left_ir(const godot::Ref<OakStreamConfig>& config);
+    bool start_right_ir(const godot::Ref<OakStreamConfig>& config);
     void stop();
     void close();
 
@@ -32,12 +33,16 @@ public:
 
     godot::Ref<godot::Texture2D> get_rgb_texture();
     godot::Ref<godot::Texture2D> get_left_ir_texture();
+    godot::Ref<godot::Texture2D> get_right_ir_texture();
 
     void set_rgb_config(const godot::Ref<OakStreamConfig>& config);
     [[nodiscard]] godot::Ref<OakStreamConfig> get_rgb_config() const;
 
     void set_left_ir_config(const godot::Ref<OakStreamConfig>& config);
     [[nodiscard]] godot::Ref<OakStreamConfig> get_left_ir_config() const;
+
+    void set_right_ir_config(const godot::Ref<OakStreamConfig>& config);
+    [[nodiscard]] godot::Ref<OakStreamConfig> get_right_ir_config() const;
 
     void set_auto_open(bool enabled);
     [[nodiscard]] bool get_auto_open() const;
@@ -48,9 +53,13 @@ public:
     void set_auto_start_left_ir(bool enabled);
     [[nodiscard]] bool get_auto_start_left_ir() const;
 
+    void set_auto_start_right_ir(bool enabled);
+    [[nodiscard]] bool get_auto_start_right_ir() const;
+
     [[nodiscard]] godot::String get_last_error() const;
     [[nodiscard]] int64_t get_rgb_frame_count() const;
     [[nodiscard]] int64_t get_left_ir_frame_count() const;
+    [[nodiscard]] int64_t get_right_ir_frame_count() const;
 
 protected:
     static void _bind_methods();
@@ -61,10 +70,12 @@ private:
 
     godot::Ref<OakStreamConfig> rgb_config_;
     godot::Ref<OakStreamConfig> left_ir_config_;
+    godot::Ref<OakStreamConfig> right_ir_config_;
 
     bool auto_open_ = true;
     bool auto_start_rgb_ = true;
     bool auto_start_left_ir_ = true;
+    bool auto_start_right_ir_ = true;
 };
 
 } // namespace godot_oak

@@ -8,13 +8,22 @@ CMAKE_BIN="${CMAKE_BIN:-$(find_tool cmake)}"
 NINJA_BIN="${NINJA_BIN:-$(find_tool ninja)}"
 
 DEPTHAI_PREFIX="${DEPTHAI_PREFIX:-$ROOT/third_party/depthai-install}"
+DEPTHAI_BUILD="$ROOT/build/depthai-macos-arm64"
+VCPKG_PREFIX="$DEPTHAI_BUILD/vcpkg_installed/arm64-osx"
+VCPKG_CMAKE_MODULES="$VCPKG_PREFIX/share/opencv4;$VCPKG_PREFIX/share/ffmpeg"
+
 BUILD_DIR="$ROOT/build/macos-arm64-debug"
 ADDON_BIN="$ROOT/godot/addons/godot_oak/bin"
 PLUGIN="$ADDON_BIN/libgodot_oak.macos.dylib"
 
 if [[ ! -d "$DEPTHAI_PREFIX" ]]; then
   echo "ERROR: no se encuentra DepthAI en: $DEPTHAI_PREFIX" >&2
-  echo "Ejecuta primero scripts/install_depthai_macos.sh" >&2
+  exit 1
+fi
+
+if [[ ! -d "$VCPKG_PREFIX" ]]; then
+  echo "ERROR: no se encuentra el prefijo vcpkg de DepthAI:" >&2
+  echo "  $VCPKG_PREFIX" >&2
   exit 1
 fi
 
@@ -25,7 +34,9 @@ echo "Configurando godot-oak..."
   -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DCMAKE_PREFIX_PATH="$DEPTHAI_PREFIX"
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+  -DCMAKE_PREFIX_PATH="$DEPTHAI_PREFIX;$VCPKG_PREFIX" \
+  -DCMAKE_MODULE_PATH="$VCPKG_CMAKE_MODULES"
 
 echo "Compilando godot-oak..."
 "$CMAKE_BIN" --build "$BUILD_DIR" --parallel 4
@@ -35,52 +46,56 @@ if [[ ! -f "$PLUGIN" ]]; then
   exit 1
 fi
 
-echo "Empaquetando librerías de DepthAI..."
-
-# Copiar todas las dylibs instaladas por DepthAI.
-while IFS= read -r -d '' dylib; do
-  cp -f "$dylib" "$ADDON_BIN/"
-done < <(find "$DEPTHAI_PREFIX/lib" \
+echo "Limpiando runtime anterior..."
+find "$ADDON_BIN" \
   -maxdepth 1 \
   -type f \
   -name '*.dylib' \
-  -print0)
+  ! -name 'libgodot_oak.macos.dylib' \
+  -delete
 
-# libusb procede del árbol vcpkg usado para construir DepthAI.
-LIBUSB_PATH="$(
-  find "$ROOT/build/depthai-macos-arm64" \
-    -path '*/arm64-osx/lib/libusb-1.0.dylib' \
-    -type f \
-    -print -quit 2>/dev/null || true
-)"
+copy_dylibs() {
+  local directory="$1"
 
-if [[ -z "$LIBUSB_PATH" || ! -f "$LIBUSB_PATH" ]]; then
-  echo "ERROR: no se encontró libusb-1.0.dylib." >&2
-  echo "Se esperaba dentro de build/depthai-macos-arm64." >&2
-  exit 1
-fi
+  if [[ ! -d "$directory" ]]; then
+    return
+  fi
 
-cp -f "$LIBUSB_PATH" "$ADDON_BIN/libusb-1.0.dylib"
+  while IFS= read -r -d '' dylib; do
+    cp -Lf "$dylib" "$ADDON_BIN/$(basename "$dylib")"
+  done < <(
+    find "$directory" \
+      -maxdepth 1 \
+      -type f \
+      -name '*.dylib' \
+      -print0
+  )
+}
+
+echo "Empaquetando librerías de DepthAI..."
+copy_dylibs "$DEPTHAI_PREFIX/lib"
+
+echo "Empaquetando librerías de OpenCV y vcpkg..."
+copy_dylibs "$VCPKG_PREFIX/lib"
 
 echo "Corrigiendo referencias dinámicas..."
 
-# Procesar el plugin y todas las dylibs empaquetadas.
 while IFS= read -r -d '' binary; do
-  basename_binary="$(basename "$binary")"
+  binary_name="$(basename "$binary")"
 
-  # Las librerías deben identificarse mediante @rpath.
-  if [[ "$binary" == *.dylib && "$binary" != "$PLUGIN" ]]; then
-    install_name_tool -id "@rpath/$basename_binary" "$binary"
+  if [[ "$binary" != "$PLUGIN" ]]; then
+    install_name_tool \
+      -id "@rpath/$binary_name" \
+      "$binary" 2>/dev/null || true
   fi
 
-  # Sustituir dependencias empaquetadas por referencias relativas al addon.
   while IFS= read -r dependency; do
-    dependency_basename="$(basename "$dependency")"
+    dependency_name="$(basename "$dependency")"
 
-    if [[ -f "$ADDON_BIN/$dependency_basename" ]]; then
+    if [[ -f "$ADDON_BIN/$dependency_name" ]]; then
       install_name_tool \
         -change "$dependency" \
-        "@loader_path/$dependency_basename" \
+        "@loader_path/$dependency_name" \
         "$binary" 2>/dev/null || true
     fi
   done < <(
@@ -90,9 +105,49 @@ while IFS= read -r -d '' binary; do
   )
 
   chmod 755 "$binary"
-done < <(find "$ADDON_BIN" -maxdepth 1 -type f -name '*.dylib' -print0)
+done < <(
+  find "$ADDON_BIN" \
+    -maxdepth 1 \
+    -type f \
+    -name '*.dylib' \
+    -print0
+)
 
-echo "Verificando binario..."
+echo "Comprobando dependencias locales no resueltas..."
+
+unresolved=0
+
+while IFS= read -r -d '' binary; do
+  while IFS= read -r dependency; do
+    case "$dependency" in
+      /usr/lib/*|/System/*|@loader_path/*|@rpath/*)
+        ;;
+      *)
+        echo "Dependencia potencialmente no empaquetada:"
+        echo "  $(basename "$binary") -> $dependency"
+        unresolved=1
+        ;;
+    esac
+  done < <(
+    otool -L "$binary" |
+      tail -n +2 |
+      awk '{print $1}'
+  )
+done < <(
+  find "$ADDON_BIN" \
+    -maxdepth 1 \
+    -type f \
+    -name '*.dylib' \
+    -print0
+)
+
+if [[ "$unresolved" -ne 0 ]]; then
+  echo "ERROR: quedan dependencias externas sin empaquetar." >&2
+  exit 1
+fi
+
+echo
+echo "Verificando plugin..."
 file "$PLUGIN"
 nm -gU "$PLUGIN" | grep godot_oak_library_init
 
@@ -102,7 +157,12 @@ otool -L "$PLUGIN"
 
 echo
 echo "Runtime empaquetado:"
-find "$ADDON_BIN" -maxdepth 1 -type f -name '*.dylib' -print | sort
+find "$ADDON_BIN" \
+  -maxdepth 1 \
+  -type f \
+  -name '*.dylib' \
+  -print |
+  sort
 
 echo
 echo "Build completado: $PLUGIN"
