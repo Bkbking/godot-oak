@@ -1,0 +1,12 @@
+[configuration]
+entry_symbol = "godot_oak_library_init"
+compatibility_minimum = "4.3"
+reloadable = true
+
+[libraries]
+macos.debug.arm64 = "res://addons/godot_oak/bin/libgodot_oak.macos.dylib"
+macos.release.arm64 = "res://addons/godot_oak/bin/libgodot_oak.macos.dylib"
+linux.debug.x86_64 = "res://addons/godot_oak/bin/libgodot_oak.linux.so"
+linux.release.x86_64 = "res://addons/godot_oak/bin/libgodot_oak.linux.so"
+windows.debug.x86_64 = "res://addons/godot_oak/bin/godot_oak.windows.dll"
+windows.release.x86_64 = "res://addons/godot_oak/bin/godot_oak.windows.dll"
